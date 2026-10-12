@@ -1,4 +1,5 @@
 deploy/node-install.sh text eol=lf
+*.go text eol=lf
 
 # Signed script-transport fixtures and their .sig files must stay exactly
 # the bytes they were signed as; a Windows checkout's LF->CRLF conversion

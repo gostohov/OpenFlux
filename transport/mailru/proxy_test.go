@@ -103,7 +103,9 @@ func TestMailruWebSocketUsesHTTPSProxy(t *testing.T) {
 		t.Fatalf("CONNECT target: %q", target)
 	}
 	bypassRequest, err := http.NewRequest(http.MethodGet, "https://bypass.openflux.test/", nil)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	if route, err := dialer.Proxy(bypassRequest); err != nil || route != nil {
 		t.Fatalf("NO_PROXY ignored: route=%v, error=%v", route, err)
 	}
