@@ -1,5 +1,10 @@
 # OpenFlux
 
+This fork includes native diagnostics, managed application execution, carrier
+limits/recovery and opt-in forward secrecy. See
+[reliability and security](docs/reliability-and-security.md) for commands,
+compatibility and protocol details.
+
 **English** | [Русский](README.ru.md)
 
 Network stack research tool. IPv4 TCP/UDP tunnel with pluggable transports

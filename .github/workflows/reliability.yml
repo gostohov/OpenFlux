@@ -1,0 +1,21 @@
+name: Native reliability
+on:
+  push:
+    branches: [feature/reliability-security]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -timeout 180s . ./transport ./transport/mailru ./provision
+      - run: go vet ./...

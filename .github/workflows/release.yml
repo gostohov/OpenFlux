@@ -26,6 +26,9 @@ concurrency:
 
 jobs:
   build:
+    # Fork CLI assets are packaged with scripts/release-fork.sh and published
+    # explicitly, avoiding duplicate releases from the upstream workflow.
+    if: github.repository == 'p1neappleXpress/OpenFlux'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
