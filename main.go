@@ -207,6 +207,17 @@ func managerRefreshLoop(m *manager.Manager) {
 }
 
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "doctor":
+			os.Exit(runDoctor(os.Args[2:], os.Stdout, os.Stderr))
+		case "run":
+			os.Exit(runManaged(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
+		case "version", "--version":
+			fmt.Printf("OpenFlux %s (%s)\n", buildVersion, buildCommit)
+			return
+		}
+	}
 	// The desktop wizard's JSON protocol owns stdout: no banner, no flags.
 	if len(os.Args) == 2 && os.Args[1] == "--node-wizard" {
 		os.Exit(runNodeWizard(os.Stdin, os.Stdout))
@@ -250,6 +261,10 @@ func main() {
 
 	codec := flag.String("codec", codecBatched, "batched (default, zstd+coalescing) or legacy (per-packet LZ4)")
 	negotiate := flag.Bool("negotiate", false, "Require encrypted, session-bound IPv4 capability negotiation on both peers (no legacy fallback)")
+	forwardSecrecy := flag.Bool("forward-secrecy", false, "Require Noise NNpsk0 forward secrecy on both peers; implies --negotiate")
+	recoveryBytes := flag.Int("recovery-queue-bytes", 4<<20, "Maximum bytes buffered per carrier during short outages")
+	recoveryTTL := flag.Duration("recovery-ttl", 30*time.Second, "Maximum time to retain a buffered carrier frame")
+	diagnosticFile := flag.String("status-file", "", "Write a redacted JSON status snapshot to this private file")
 	maxPacket := flag.Int("max-packet-size", transport.MaxNegotiatedPacket, "Maximum IPv4 packet in negotiated mode (1280..65000); not the Internet path MTU")
 	cookieStorePath := flag.String("cookie-store", "",
 		"Path to the cookie jar file. Default: ./cookies-<transport>.json in the current directory "+
@@ -480,6 +495,23 @@ DEPRECATED (removed in v2)
 		flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
 
 		applyConfString(conf.Interface, "Role", "role", role, setFlags)
+		if v, ok := confValue(conf.Interface, "ForwardSecrecy"); ok && !setFlags["forward-secrecy"] {
+			*forwardSecrecy = confBool(v, *forwardSecrecy)
+		}
+		if v, ok := confValue(conf.Interface, "RecoveryQueueBytes"); ok && !setFlags["recovery-queue-bytes"] {
+			parsed, err := strconv.Atoi(v)
+			if err != nil {
+				log.Fatal("invalid RecoveryQueueBytes")
+			}
+			*recoveryBytes = parsed
+		}
+		if v, ok := confValue(conf.Interface, "RecoveryTTL"); ok && !setFlags["recovery-ttl"] {
+			parsed, err := time.ParseDuration(v)
+			if err != nil {
+				log.Fatal("invalid RecoveryTTL")
+			}
+			*recoveryTTL = parsed
+		}
 		// Role may have just changed: isExit above was computed from the
 		// pre-.conf value, so a config-only "Role = exit" (no --role on the
 		// command line, as every node-wizard deployment runs) left isExit
@@ -651,6 +683,9 @@ DEPRECATED (removed in v2)
 	// phpbox exit (deploy/phpbox over cups). This is a circuit-level TCP
 	// tunnel, not L7 - the exit never parses the application protocol.
 	// The debug level is set here, not only further down: this branch returns before that code runs.
+	if *forwardSecrecy && *mode == "stream" {
+		log.Fatal("--forward-secrecy requires an encrypted Session; stream mode is unsupported")
+	}
 	if *role == roleClient && *mode == "stream" {
 		utils.SetLevel(*debug)
 		if *sensitive || *sensitiveAlias {
@@ -858,6 +893,9 @@ DEPRECATED (removed in v2)
 	// layering while the exit does not answer the handshake and upgrades
 	// once it does; an exit serves classic clients and Session clients.
 	// Only --negotiate is strict. Without a key only classic is possible.
+	if *forwardSecrecy {
+		*negotiate = true
+	}
 	configuredSession := *negotiate || *transportsFlag != "" || len(confTransports) > 0
 	classicCompat := false
 	switch {
@@ -890,6 +928,15 @@ DEPRECATED (removed in v2)
 		}
 		sess, err := transport.NewSession(params, isExit)
 		if err != nil {
+			log.Fatal(err)
+		}
+		if err := sess.SetForwardSecrecy(*forwardSecrecy); err != nil {
+			log.Fatal(err)
+		}
+		options := transport.DefaultRecoveryOptions()
+		options.QueueBytes = *recoveryBytes
+		options.PacketTTL = *recoveryTTL
+		if err := sess.SetRecoveryOptions(options); err != nil {
 			log.Fatal(err)
 		}
 		if classicCompat {
@@ -1047,6 +1094,9 @@ DEPRECATED (removed in v2)
 		return
 	}
 
+	if *diagnosticFile != "" && managerInst != nil {
+		go writeStatusLoop(*diagnosticFile, managerInst.Session())
+	}
 	if err := trans.Start(); err != nil {
 		log.Fatalf("Failed to start transport: %v", err)
 	}

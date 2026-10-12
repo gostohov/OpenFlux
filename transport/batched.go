@@ -190,15 +190,19 @@ func (b *BatchedTransport) recordSendError(err error) {
 
 func (b *BatchedTransport) flushLoop() {
 	utils.Debugf("[BATCH] flushLoop: started")
+	var pending []byte
 	for b.running.Load() {
-		var first []byte
-		select {
-		case <-b.stopCh:
-			utils.Debugf("[BATCH] flushLoop: stop signal, exiting")
-			return
-		case first = <-b.queue:
-			utils.Debugf("[BATCH] flushLoop: dequeued first packet size=%d (queue %d/%d)",
-				len(first), len(b.queue), cap(b.queue))
+		first := pending
+		pending = nil
+		if first == nil {
+			select {
+			case <-b.stopCh:
+				utils.Debugf("[BATCH] flushLoop: stop signal, exiting")
+				return
+			case first = <-b.queue:
+				utils.Debugf("[BATCH] flushLoop: dequeued first packet size=%d (queue %d/%d)",
+					len(first), len(b.queue), cap(b.queue))
+			}
 		}
 		batch := [][]byte{first}
 		size := 2 + len(first)
@@ -209,6 +213,10 @@ func (b *BatchedTransport) flushLoop() {
 		for size < b.maxBatchBytes && len(batch) < b.maxBatchCount {
 			select {
 			case p := <-b.queue:
+				if size+2+len(p) > b.maxBatchBytes {
+					pending = p
+					break drainNow
+				}
 				batch = append(batch, p)
 				size += 2 + len(p)
 			default:
@@ -220,7 +228,7 @@ func (b *BatchedTransport) flushLoop() {
 		// Phase 2: brief linger to catch stragglers arriving just after the
 		// burst. Negligible next to the channel RTT, but it fills batches
 		// during steady bulk transfer.
-		if b.lingerMs > 0 && size < b.maxBatchBytes && len(batch) < b.maxBatchCount {
+		if pending == nil && b.lingerMs > 0 && size < b.maxBatchBytes && len(batch) < b.maxBatchCount {
 			timer := time.NewTimer(time.Duration(b.lingerMs) * time.Millisecond)
 		linger:
 			for size < b.maxBatchBytes && len(batch) < b.maxBatchCount {
@@ -230,6 +238,10 @@ func (b *BatchedTransport) flushLoop() {
 					utils.Debugf("[BATCH] flushLoop: stop during linger, exiting")
 					return
 				case p := <-b.queue:
+					if size+2+len(p) > b.maxBatchBytes {
+						pending = p
+						break linger
+					}
 					batch = append(batch, p)
 					size += 2 + len(p)
 				case <-timer.C:

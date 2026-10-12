@@ -163,3 +163,36 @@ func TestBatchedTransportRejectsOversizedPacket(t *testing.T) {
 		t.Fatal("expected oversized packet error")
 	}
 }
+
+func TestBatchByteBudgetDoesNotOvershootOrReorder(t *testing.T) {
+	inner := &fakeTransport{}
+	batch := NewBatchedTransport(inner)
+	batch.maxBatchBytes = 100
+	batch.lingerMs = 1
+	if err := batch.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer batch.Stop()
+	want := [][]byte{bytes.Repeat([]byte{1}, 60), bytes.Repeat([]byte{2}, 50), bytes.Repeat([]byte{3}, 200), bytes.Repeat([]byte{4}, 10)}
+	for _, p := range want {
+		if err := batch.Send(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for inner.sendCount() < len(want) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	inner.mu.Lock()
+	frames := append([][]byte(nil), inner.sent...)
+	inner.mu.Unlock()
+	if len(frames) != len(want) {
+		t.Fatalf("frames=%d; oversized packet merged with its neighbour", len(frames))
+	}
+	for index, frame := range frames {
+		packets, err := decodeBatch(frame)
+		if err != nil || len(packets) != 1 || !bytes.Equal(packets[0], want[index]) {
+			t.Fatalf("frame %d changed or reordered", index)
+		}
+	}
+}

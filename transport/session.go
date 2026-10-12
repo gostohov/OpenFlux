@@ -15,7 +15,9 @@ import (
 
 // Session is one logical session between a client and an exit node.
 type Session struct {
-	mu sync.Mutex
+	mu              sync.Mutex
+	forwardSecrecy  bool
+	recoveryOptions RecoveryOptions
 
 	local            [32]byte
 	peer             [32]byte
@@ -140,6 +142,9 @@ type transportLink struct {
 func (s *Session) SetClassic(codec string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.forwardSecrecy {
+		return
+	}
 	if s.exit {
 		s.classic = ClassicAccept
 	} else {
@@ -179,6 +184,18 @@ func (s *Session) SetAlternateContexts(contexts []string) {
 // batched(encrypted(session side)) and, with classic mode on, the classic
 // encrypted(codec(classic side)) sharing its keys.
 func (s *Session) newLink(name string, raw Transport, secret, context string, priority int) (*transportLink, error) {
+	carrier := raw
+	recovery, err := NewRecoveryTransport(raw, s.recoveryOptions)
+	if err != nil {
+		return nil, err
+	}
+	raw = recovery
+	if s.forwardSecrecy {
+		raw, err = NewNoiseTransport(raw, secret, context, s.exit)
+		if err != nil {
+			return nil, err
+		}
+	}
 	d := newFrameDemux(raw, name)
 	enc, err := NewEncryptedTransport(d.side(true), secret, context, s.exit)
 	if err != nil {
@@ -197,10 +214,18 @@ func (s *Session) newLink(name string, raw Transport, secret, context string, pr
 		batched:   NewBatchedTransport(enc),
 		priority:  priority,
 	}
+	if s.forwardSecrecy {
+		link.batched.maxBatchBytes = min(link.batched.maxBatchBytes, 65480)
+	}
 	// Some carriers reject large cursor messages even when each IP packet is
 	// within the negotiated MTU. Keep their batches below the carrier's limit.
-	if limited, ok := raw.(interface{ BatchPacketLimit() int }); ok {
+	if limited, ok := carrier.(interface{ BatchPacketLimit() int }); ok {
 		if limit := limited.BatchPacketLimit(); limit > 0 {
+			link.batched.maxBatchCount = min(link.batched.maxBatchCount, limit)
+		}
+	}
+	if limited, ok := carrier.(LimitedCarrier); ok {
+		if limit := limited.CarrierLimits().MaxBatchPackets; limit > 0 {
 			link.batched.maxBatchCount = min(link.batched.maxBatchCount, limit)
 		}
 	}
@@ -216,6 +241,7 @@ func NewSession(p PeerParameters, exit bool) (*Session, error) {
 		return nil, errors.New("session requires IPv4/TCP and a packet limit from 1280 to 65000")
 	}
 	s := &Session{
+		recoveryOptions:  DefaultRecoveryOptions(),
 		params:           p,
 		exit:             exit,
 		links:            make(map[string]*transportLink),
@@ -238,6 +264,31 @@ func NewSession(p PeerParameters, exit bool) (*Session, error) {
 	utils.Debugf("[SESSION] created side=%s local=%s params.caps=0x%x params.maxPacket=%d",
 		side, shortID(s.local), p.Capabilities, p.MaxPacketSize)
 	return s, nil
+}
+
+// SetForwardSecrecy must be called before adding carriers. Both peers must
+// explicitly enable it; it cannot be combined with classic fallback.
+func (s *Session) SetForwardSecrecy(enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started || len(s.links) > 0 || (enabled && s.classic != ClassicOff) {
+		return errors.New("configure forward secrecy before carriers, without classic fallback")
+	}
+	s.forwardSecrecy = enabled
+	return nil
+}
+
+func (s *Session) SetRecoveryOptions(options RecoveryOptions) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started || len(s.links) > 0 {
+		return errors.New("configure recovery before adding carriers")
+	}
+	if options.QueueBytes < 1 || options.QueueBytes > 64<<20 || options.QueuePackets < 1 || options.QueuePackets > 4096 || options.PacketTTL <= 0 || options.PacketTTL > 5*time.Minute {
+		return errors.New("recovery limits out of range")
+	}
+	s.recoveryOptions = options
+	return nil
 }
 
 func validParameters(p PeerParameters) bool {
@@ -1005,6 +1056,16 @@ func (s *Session) Send(p []byte) error {
 		Data:  &control.DataTail{Sequence: seq},
 	}
 	links := s.liveLinksLocked()
+	if len(links) == 0 {
+		// Preserve the established session through a bounded carrier outage.
+		// Recovery queues enforce their own byte and frame-age limits.
+		for _, name := range s.order {
+			link := s.links[name]
+			if link.started && !link.dead && !link.lastHeard.IsZero() && time.Since(link.lastHeard) < s.recoveryOptions.PacketTTL {
+				links = append(links, link)
+			}
+		}
+	}
 	s.mu.Unlock()
 
 	if len(links) == 0 {

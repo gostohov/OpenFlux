@@ -246,6 +246,10 @@ func (t *DirectTransport) Stats() TransportStats {
 // Drops returns the number of Send calls dropped because the queue was full.
 func (t *DirectTransport) Drops() uint64 { return t.drops.Load() }
 
+func (t *DirectTransport) CarrierLimits() CarrierLimits {
+	return CarrierLimits{MaxPayloadBytes: t.config.MaxRecordBytes}
+}
+
 // ---- exit mode ----
 
 func (t *DirectTransport) acceptLoop() {

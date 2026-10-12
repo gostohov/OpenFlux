@@ -156,6 +156,7 @@ func waitMailruSocketIO(session *DocSession, token string) error {
 }
 
 type MailruDocsTransport struct {
+	diagnostic transport.DiagnosticState
 	*transport.BaseTransport
 
 	weblink string
@@ -191,6 +192,15 @@ func NewMailruDocsTransport(weblink string, config transport.TransportConfig) *M
 // BatchPacketLimit prevents coalesced TCP packets from exceeding the editor's
 // cursor-message limit. The SOCKS stack already uses an IP MTU of at most 1500.
 func (t *MailruDocsTransport) BatchPacketLimit() int { return 1 }
+
+func (t *MailruDocsTransport) CarrierLimits() transport.CarrierLimits {
+	// Conservative binary limit, allowing for Base64 and the cursor JSON envelope.
+	return transport.CarrierLimits{MaxPayloadBytes: 2048, MaxBatchPackets: 1}
+}
+
+func (t *MailruDocsTransport) DiagnosticStatus() transport.CarrierDiagnostic {
+	return t.diagnostic.Snapshot()
+}
 
 func normalizeWeblink(weblink string) string {
 	weblink = strings.TrimSpace(weblink)
@@ -242,6 +252,19 @@ func (t *MailruDocsTransport) Send(data []byte) error {
 	}
 }
 
+func (t *MailruDocsTransport) Stop() error {
+	err := t.BaseTransport.Stop()
+	t.Mu.Lock()
+	session := t.session
+	t.session = nil
+	t.Mu.Unlock()
+	if session != nil && session.Conn != nil {
+		_ = session.Conn.Close()
+	}
+	t.diagnostic.Set("stopped", "", 0)
+	return err
+}
+
 func newMailruWebSocketDialer() *websocket.Dialer {
 	return &websocket.Dialer{
 		// Use the same HTTPS_PROXY/NO_PROXY route as fetchDocInfo. Corporate
@@ -282,8 +305,10 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 			userID = t.baseUserID + suffix
 		}
 
+		t.diagnostic.Set("document", "", 0)
 		info, err := t.fetchDocInfo(t.weblink)
 		if err != nil {
+			t.diagnostic.Set("document", "document_unreachable", 0)
 			utils.Debugf("[M-DOCS] fetchDocInfo failed: %v", err)
 			if utils.Throttled("m-docs.fetch", time.Minute) {
 				utils.Infof("[M-DOCS] cannot open the document: %v; retrying", err)
@@ -302,12 +327,14 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 		headers.Set("Origin", "https://docs.datacloudmail.ru")
 
 		utils.Debugf("[M-DOCS] WebSocket dial %s", info.WsURL)
+		t.diagnostic.Set("websocket", "", 0)
 		conn, resp, err := dialer.Dial(info.WsURL, headers)
 		if err != nil {
 			status := 0
 			if resp != nil {
 				status = resp.StatusCode
 			}
+			t.diagnostic.Set("websocket", "websocket_dial_failed", status)
 			utils.Debugf("[M-DOCS] WebSocket dial failed (http %d): %v", status, err)
 			t.scheduleReconnect(attempt)
 			return
@@ -327,6 +354,7 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 		}
 
 		if err := waitMailruSocketIO(session, info.Token); err != nil {
+			t.diagnostic.Set("websocket", "socketio_handshake_failed", 0)
 			utils.Debugf("[M-DOCS] Socket.IO handshake failed: %v", err)
 			_ = conn.Close()
 			t.scheduleReconnect(attempt)
@@ -378,6 +406,7 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 			"time":                  1000,
 			"supportAuthChangesAck": true,
 		}
+		t.diagnostic.Set("editor", "", 0)
 		messagePart, _ := json.Marshal([]interface{}{"message", authMsg})
 		session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart))))
 
@@ -385,6 +414,7 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 		for t.IsRunning() {
 			_, message, err := conn.ReadMessage()
 			if err != nil {
+				t.diagnostic.Set("disconnected", "websocket_closed", 0)
 				utils.Debugf("[M-DOCS] Read error: %v", err)
 				if utils.Throttled("m-docs.drop", time.Minute) {
 					utils.Infof("[M-DOCS] connection to the document dropped: %v; reconnecting", err)
@@ -423,11 +453,15 @@ func (t *MailruDocsTransport) writerLoop() {
 	var pending []byte
 	for t.IsRunning() {
 		if pending == nil {
-			packet, ok := <-queue
-			if !ok {
+			select {
+			case <-t.Done():
 				return
+			case packet, ok := <-queue:
+				if !ok {
+					return
+				}
+				pending = packet
 			}
-			pending = packet
 		}
 
 		t.Mu.RLock()
@@ -453,7 +487,11 @@ func (t *MailruDocsTransport) keepAliveLoop() {
 	keepAliveMsg := buildCursorMessage([]byte("---KA---"))
 
 	for t.IsRunning() {
-		<-ticker.C
+		select {
+		case <-t.Done():
+			return
+		case <-ticker.C:
+		}
 		t.Mu.Lock()
 		session := t.session
 		t.Mu.Unlock()
@@ -583,6 +621,13 @@ func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 					code = v
 				}
 				utils.Debugf("[M-DOCS] editor event type=%q result=%v code=%v", status.Type, result, code)
+				if status.Type == "disconnectReason" || status.Type == "error" || (status.Type == "auth" && result != float64(1)) {
+					codeName := "editor_rejected"
+					if code == float64(4004) {
+						codeName = "editor_access_denied"
+					}
+					t.diagnostic.Set("editor", codeName, 0)
+				}
 				if status.Type == "error" && code == float64(4008) && session != nil && session.Conn != nil {
 					// The editor's document key was retired after a save. A live
 					// Socket.IO heartbeat does not make that session usable again.
@@ -643,6 +688,7 @@ func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 		t.Mu.Lock()
 		if t.session == session {
 			t.SetConnected(true)
+			t.diagnostic.Set("authenticated", "", 0)
 		}
 		t.Mu.Unlock()
 		utils.Debugf("[M-DOCS] Auth OK for user %s", session.UserID)
@@ -689,7 +735,12 @@ func (t *MailruDocsTransport) scheduleReconnect(attempt int) {
 	}
 	d := reconnectBackoff(next)
 	utils.Debugf("[M-DOCS] reconnecting in %v (attempt %d)", d, next)
-	time.Sleep(d)
+	select {
+	case <-t.Done():
+		t.reconnecting.Store(false)
+		return
+	case <-time.After(d):
+	}
 	t.reconnecting.Store(false) // a failed connect schedules the next one itself
 	if !t.IsRunning() {
 		return
