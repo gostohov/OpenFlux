@@ -1,9 +1,13 @@
 package mailru
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,6 +35,7 @@ func TestCursorPayloadsBatch(t *testing.T) {
 		{"keep-alive first, data behind it", `42["message",{"type":"cursor","messages":[` + ka + "," + cursorEntry(b64("data")) + `]}]`, []string{b64("data")}},
 		{"data, keep-alive, data", `42["message",{"type":"cursor","messages":[` + cursorEntry(b64("x")) + "," + ka + "," + cursorEntry(b64("y")) + `]}]`, []string{b64("x"), b64("y")}},
 		{"only a keep-alive", `42["message",{"type":"cursor","messages":[` + ka + `]}]`, nil},
+		{"encoded keep-alive", `42["message",{"type":"cursor","messages":[` + cursorEntry(b64("---KA---")) + "," + cursorEntry(b64("data")) + `]}]`, []string{b64("data")}},
 	}
 	for _, c := range cases {
 		if got := cursorPayloads(c.text); !reflect.DeepEqual(got, c.want) {
@@ -39,8 +44,43 @@ func TestCursorPayloadsBatch(t *testing.T) {
 	}
 }
 
+// Validate envelopes the same way as the editor, including packet sizes far
+// larger than a real text cursor and the non-packet heartbeat marker.
+func TestCursorEnvelopeUsesActualBinaryLength(t *testing.T) {
+	for _, payload := range [][]byte{[]byte("---KA---"), []byte("test-transport"), bytes.Repeat([]byte{0, 255, 1}, 4096)} {
+		var event []json.RawMessage
+		frame := buildCursorMessage(payload)
+		if err := json.Unmarshal(frame[2:], &event); err != nil {
+			t.Fatal(err)
+		}
+		var body struct {
+			Type   string `json:"type"`
+			Cursor string `json:"cursor"`
+		}
+		if err := json.Unmarshal(event[1], &body); err != nil {
+			t.Fatal(err)
+		}
+		parts := strings.SplitN(body.Cursor, ";", 2)
+		if len(parts) != 2 || body.Type != "cursor" {
+			t.Fatal("bad cursor envelope")
+		}
+		length, err := strconv.Atoi(parts[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(parts[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if length != len(decoded) || !bytes.Equal(decoded, payload) {
+			t.Fatalf("length=%d decoded=%d wanted=%d", length, len(decoded), len(payload))
+		}
+	}
+}
+
 func TestHandleMessageDeliversEveryPacketOfABatch(t *testing.T) {
 	tr := NewMailruDocsTransport("Vuri/test", transport.DefaultConfig())
+	tr.SetConnected(true)
 	var got []string
 	tr.Receive(func(b []byte) { got = append(got, string(b)) })
 	msg := `42["message",{"type":"cursor","messages":[` + cursorEntry("---KA---") + "," +

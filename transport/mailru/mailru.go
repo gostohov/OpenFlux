@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -187,6 +188,10 @@ func NewMailruDocsTransport(weblink string, config transport.TransportConfig) *M
 	return t
 }
 
+// BatchPacketLimit prevents coalesced TCP packets from exceeding the editor's
+// cursor-message limit. The SOCKS stack already uses an IP MTU of at most 1500.
+func (t *MailruDocsTransport) BatchPacketLimit() int { return 1 }
+
 func normalizeWeblink(weblink string) string {
 	weblink = strings.TrimSpace(weblink)
 	for _, prefix := range []string{
@@ -237,6 +242,21 @@ func (t *MailruDocsTransport) Send(data []byte) error {
 	}
 }
 
+func newMailruWebSocketDialer() *websocket.Dialer {
+	return &websocket.Dialer{
+		// Use the same HTTPS_PROXY/NO_PROXY route as fetchDocInfo. Corporate
+		// networks may allow the editor only through their HTTP CONNECT proxy.
+		Proxy: http.ProxyFromEnvironment,
+		// Mail.ru's upgrade requires permessage-deflate to avoid HTTP 409.
+		EnableCompression: true,
+		HandshakeTimeout:  15 * time.Second,
+		NetDialContext: netbind.Wrap(&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
+}
+
 func (t *MailruDocsTransport) connectToDoc(attempt int) {
 	if !t.IsRunning() {
 		return
@@ -272,19 +292,7 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 			return
 		}
 
-		dialer := websocket.Dialer{
-			// Mail.ru's nginx answers 409 Conflict to an upgrade that does
-			// not offer permessage-deflate. gorilla/websocket only sends the
-			// Sec-WebSocket-Extensions header when compression is enabled, so
-			// without this the handshake was rejected before any auth and the
-			// carrier never came up. Reported by @pirsasha (issue #163).
-			EnableCompression: true,
-			HandshakeTimeout:  15 * time.Second,
-			NetDialContext: netbind.Wrap(&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-		}
+		dialer := newMailruWebSocketDialer()
 		headers := http.Header{}
 		headers.Set("User-Agent", mailruUserAgent)
 		// Some Mail.ru edge nodes still answer 409 to the upgrade when the
@@ -327,7 +335,6 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 
 		t.Mu.Lock()
 		t.session = session
-		t.SetConnected(true)
 		t.Mu.Unlock()
 
 		if existingSession == nil {
@@ -431,9 +438,7 @@ func (t *MailruDocsTransport) writerLoop() {
 			continue
 		}
 
-		payload := base64.StdEncoding.EncodeToString(pending)
-		msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
-		if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
+		if err := session.safeWrite(websocket.TextMessage, buildCursorMessage(pending)); err != nil {
 			utils.Debugf("[M-DOCS] Write error: %v", err)
 			time.Sleep(15 * time.Millisecond)
 			continue
@@ -445,7 +450,7 @@ func (t *MailruDocsTransport) writerLoop() {
 func (t *MailruDocsTransport) keepAliveLoop() {
 	ticker := time.NewTicker(t.GetConfig().KeepAliveInterval)
 	defer ticker.Stop()
-	keepAliveMsg := `42["message",{"type":"cursor","cursor":"18;---KA---"}]`
+	keepAliveMsg := buildCursorMessage([]byte("---KA---"))
 
 	for t.IsRunning() {
 		<-ticker.C
@@ -453,14 +458,21 @@ func (t *MailruDocsTransport) keepAliveLoop() {
 		session := t.session
 		t.Mu.Unlock()
 
-		if session != nil && session.Conn != nil {
-			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
+		if t.IsConnected() && session != nil && session.Conn != nil {
+			if err := session.safeWrite(websocket.TextMessage, keepAliveMsg); err != nil {
 				utils.Debugf("[M-DOCS] Keep-alive failed, closing the connection to reconnect: %v", err)
 				t.SetConnected(false)
 				_ = session.Conn.Close()
 			}
 		}
 	}
+}
+
+// Cursor envelopes are <decoded byte length>;<Base64 data>, just like the
+// browser's binary cursor serializer. Mail.ru rejects invalid envelopes with
+// ACCESS_DENIED (4004), including the former fixed 18 and raw keep-alive.
+func buildCursorMessage(payload []byte) []byte {
+	return []byte(fmt.Sprintf(`42["message",{"type":"cursor","cursor":"%d;%s"}]`, len(payload), base64.StdEncoding.EncodeToString(payload)))
 }
 
 // editorActivityLoop периодически отправляет в документ saveChanges-сообщение
@@ -472,6 +484,15 @@ func (t *MailruDocsTransport) keepAliveLoop() {
 // writerLoop и keepAliveLoop, и так же терпит переподключение — если сессии
 // сейчас нет, итерация просто пропускается.
 func (t *MailruDocsTransport) editorActivityLoop() {
+	// The live editor can accept auth with edit=true and then reject the
+	// synthetic saveChanges with ACCESS_DENIED (4004). Cursor packets and
+	// heartbeats are sufficient for this transport and do not edit the file.
+	// Keep document writes explicitly opt-in instead of disconnecting a
+	// working carrier every 0.5-5 seconds.
+	if os.Getenv("OPENFLUX_MAILRU_EDITOR_ACTIVITY") != "1" {
+		utils.Infof("[M-DOCS] synthetic document edits disabled; using cursor transport")
+		return
+	}
 	const (
 		minDelay = 500 * time.Millisecond
 		maxDelay = 5 * time.Second
@@ -489,7 +510,7 @@ func (t *MailruDocsTransport) editorActivityLoop() {
 		t.Mu.RLock()
 		session := t.session
 		t.Mu.RUnlock()
-		if session == nil || session.Conn == nil {
+		if !t.IsConnected() || session == nil || session.Conn == nil {
 			continue
 		}
 
@@ -540,6 +561,70 @@ func BuildSaveChanges(userID string) []byte {
 
 func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 	text := string(data)
+	// Diagnose editor admission without logging tokens, document contents,
+	// cookies, or raw frames.
+	if strings.HasPrefix(text, "42") {
+		var event []json.RawMessage
+		if json.Unmarshal(data[2:], &event) == nil && len(event) > 1 {
+			var status struct {
+				Type     string      `json:"type"`
+				Result   interface{} `json:"result"`
+				Code     interface{} `json:"code"`
+				WaitAuth bool        `json:"waitAuth"`
+			}
+			if json.Unmarshal(event[1], &status) == nil && status.Type != "cursor" {
+				var result, code interface{}
+				switch v := status.Result.(type) {
+				case float64, bool:
+					result = v
+				}
+				switch v := status.Code.(type) {
+				case float64, bool:
+					code = v
+				}
+				utils.Debugf("[M-DOCS] editor event type=%q result=%v code=%v", status.Type, result, code)
+				if status.Type == "error" && code == float64(4008) && session != nil && session.Conn != nil {
+					// The editor's document key was retired after a save. A live
+					// Socket.IO heartbeat does not make that session usable again.
+					// Close it so the read loop fetches a fresh key and reconnects.
+					t.Mu.Lock()
+					current := t.session == session
+					t.Mu.Unlock()
+					if current {
+						t.SetConnected(false)
+						_ = session.Conn.Close()
+					}
+					return
+				}
+				if status.Type == "connectState" && status.WaitAuth && session != nil && session.Conn != nil {
+					// A second editor waits until the admitted editor releases its
+					// auth lock. We have no pending editor changes to save here.
+					// Release only this session's auth lock, never document edits
+					// or other users' locks (deleteIndex=null, releaseLocks=false).
+					t.Mu.Lock()
+					current := t.session == session
+					t.Mu.Unlock()
+					if current && t.IsConnected() {
+						unlock := []byte(`42["message",{"type":"unLockDocument","isSave":false,"unlock":true,"deleteIndex":null,"releaseLocks":false}]`)
+						if err := session.safeWrite(websocket.TextMessage, unlock); err != nil {
+							utils.Debugf("[M-DOCS] auth lock release write error: %v", err)
+						}
+					}
+					return
+				}
+				if status.Type == "authChanges" && session != nil && session.Conn != nil {
+					// We advertise supportAuthChangesAck in editor auth. The
+					// editor waits for each change chunk to be acknowledged before
+					// completing auth, including on documents already used as carriers.
+					ack := []byte(`42["message",{"type":"authChangesAck"}]`)
+					if err := session.safeWrite(websocket.TextMessage, ack); err != nil {
+						utils.Debugf("[M-DOCS] authChangesAck write error: %v", err)
+					}
+					return
+				}
+			}
+		}
+	}
 
 	if text == "2" {
 		if session != nil && session.Conn != nil {
@@ -552,11 +637,19 @@ func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 	}
 
 	if strings.Contains(text, `"type":"auth"`) && strings.Contains(text, `"result":1`) {
+		// Socket.IO can be ready while the document editor is still loading.
+		// Sending the first session hello before this acknowledgment loses the
+		// exit's challenge: the server has not admitted us to coauthoring yet.
+		t.Mu.Lock()
+		if t.session == session {
+			t.SetConnected(true)
+		}
+		t.Mu.Unlock()
 		utils.Debugf("[M-DOCS] Auth OK for user %s", session.UserID)
 		return
 	}
 
-	if strings.Contains(text, "cursor") {
+	if t.IsConnected() && strings.Contains(text, "cursor") {
 		for _, base64Str := range cursorPayloads(text) {
 			decoded, err := base64.StdEncoding.DecodeString(base64Str)
 			if err != nil {
@@ -578,7 +671,7 @@ func cursorPayloads(text string) []string { return CursorPayloads(text) }
 func CursorPayloads(text string) []string {
 	var out []string
 	for _, m := range cursorPayloadRe.FindAllStringSubmatch(text, -1) {
-		if len(m) > 1 && m[1] != "---KA---" {
+		if len(m) > 1 && m[1] != "---KA---" && m[1] != base64.StdEncoding.EncodeToString([]byte("---KA---")) {
 			out = append(out, m[1])
 		}
 	}

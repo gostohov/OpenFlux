@@ -197,6 +197,13 @@ func (s *Session) newLink(name string, raw Transport, secret, context string, pr
 		batched:   NewBatchedTransport(enc),
 		priority:  priority,
 	}
+	// Some carriers reject large cursor messages even when each IP packet is
+	// within the negotiated MTU. Keep their batches below the carrier's limit.
+	if limited, ok := raw.(interface{ BatchPacketLimit() int }); ok {
+		if limit := limited.BatchPacketLimit(); limit > 0 {
+			link.batched.maxBatchCount = min(link.batched.maxBatchCount, limit)
+		}
+	}
 	if classic != ClassicOff {
 		link.classicCodec = NewCodecTransport(d.side(false), codec, !s.exit)
 		link.classicEnc = enc.SharingKeys(link.classicCodec)
@@ -213,7 +220,7 @@ func NewSession(p PeerParameters, exit bool) (*Session, error) {
 		exit:             exit,
 		links:            make(map[string]*transportLink),
 		done:             make(chan struct{}),
-		handshakeTimeout: 20 * time.Second,
+		handshakeTimeout: 90 * time.Second,
 		helloInterval:    250 * time.Millisecond,
 		restartMin:       time.Second,
 		restartMax:       30 * time.Second,
