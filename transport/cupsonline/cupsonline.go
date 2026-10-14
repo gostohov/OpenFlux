@@ -718,6 +718,16 @@ func (w *cupsWS) markAlive() {
 	}
 }
 
+func newCupsWebSocketDialer(config CupsonlineConfig) *websocket.Dialer {
+	return &websocket.Dialer{
+		Proxy:            http.ProxyFromEnvironment,
+		NetDialContext:   netbind.DialContext,
+		HandshakeTimeout: config.WSHandshakeTimeout,
+		ReadBufferSize:   config.ReadBufferSize,
+		WriteBufferSize:  config.WriteBufferSize,
+	}
+}
+
 func (w *cupsWS) connectAndServe() error {
 	a := w.auth()
 	wsURL := strings.Replace(a.connURL, "https://", "wss://", 1)
@@ -731,12 +741,7 @@ func (w *cupsWS) connectAndServe() error {
 		header.Add("Cookie", c.Name+"="+c.Value)
 	}
 
-	dialer := websocket.Dialer{
-		NetDialContext:   netbind.DialContext,
-		HandshakeTimeout: w.config.WSHandshakeTimeout,
-		ReadBufferSize:   w.config.ReadBufferSize,
-		WriteBufferSize:  w.config.WriteBufferSize,
-	}
+	dialer := newCupsWebSocketDialer(w.config)
 	conn, _, err := dialer.DialContext(w.ctx, wsURL, header)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)

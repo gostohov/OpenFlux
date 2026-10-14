@@ -50,6 +50,10 @@ NO_PROXY exclusions are retained. Applications must support the relevant proxy
 variables; this command does not intercept arbitrary networking or enforce a
 system firewall. Application-specific proxy settings can override environment.
 
+The native Cups.online WebSocket carrier honors HTTP_PROXY / HTTPS_PROXY and
+NO_PROXY. Its proxy regression test transfers a WebSocket frame through an HTTP
+CONNECT proxy with TLS certificate verification enabled.
+
 A configuration lock prevents simultaneous managed sessions using the same
 configuration file. Relative key/cookie paths are resolved by running the core
 in the configuration directory. The application stays in the invoking directory.
