@@ -17,7 +17,8 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: go test ./... -count=1
-      - run: go test -race ./... -count=1
+      # Keep CPU-heavy crypto packages from starving timed relay fixtures.
+      - run: go test -race -p 1 ./... -count=1
       - run: go vet ./...
       - name: Compile isolated Linux raw UDP test
         run: go test -race -c -o "$RUNNER_TEMP/openflux-l3.test" ./tunnel/l3
