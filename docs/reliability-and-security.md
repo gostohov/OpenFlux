@@ -59,8 +59,10 @@ in the configuration directory. The application stays in the invoking directory.
 
 Native carriers can implement `LimitedCarrier` to declare binary payload size,
 maximum packets per batch and messages per second. Limits apply after encryption
-and before carrier encoding. Mail.ru uses a conservative 2048-byte binary limit
-and one IP packet per batch; its JSON/Base64 envelope adds overhead. Direct TCP
+and before carrier encoding. Mail.ru uses a conservative 1450-byte binary limit
+and one IP packet per batch, keeping its JSON/Base64 cursor envelope below a
+2048-byte wire budget. Queued cursors wait for editor authentication after a
+reconnect. Direct TCP
 uses its configured record limit. Unspecified limits keep existing behavior.
 
 Oversized encrypted messages are fragmented into bounded `OFF` v1 records and

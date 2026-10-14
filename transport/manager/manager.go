@@ -87,6 +87,12 @@ func New(session *transport.Session, factory Factory, secret, context string) *M
 // Session returns the underlying Session.
 func (m *Manager) Session() *transport.Session { return m.session }
 
+// PeerParameters preserves Session capabilities across the manager facade.
+// Tunnel stacks use this interface to honor the negotiated packet size.
+func (m *Manager) PeerParameters() (transport.PeerParameters, bool) {
+	return m.session.PeerParameters()
+}
+
 // Add attaches an already-built transport. Priority is used to order
 // transports for handshake and for control traffic.
 func (m *Manager) Add(name, typ string, raw transport.Transport, priority int, provider CookieProvider) error {

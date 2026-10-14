@@ -12,6 +12,39 @@ type captureTransport struct {
 
 func (c *captureTransport) Receive(cb func([]byte)) { c.cb = cb }
 
+type parameterCapture struct {
+	captureTransport
+	parameters PeerParameters
+	ready      bool
+}
+
+func (c *parameterCapture) PeerParameters() (PeerParameters, bool) {
+	return c.parameters, c.ready
+}
+
+func TestPortDemuxPreservesNegotiatedParameters(t *testing.T) {
+	inner := &parameterCapture{parameters: PeerParameters{Capabilities: CapabilityIPv4 | CapabilityTCP, MaxPacketSize: 1280}, ready: true}
+	demux := NewPortDemux(inner, 12000, 12999)
+	for _, endpoint := range []Transport{demux, demux.Side()} {
+		provider, ok := endpoint.(PeerParameterProvider)
+		if !ok {
+			t.Fatal("demux endpoint hides negotiated parameters")
+		}
+		if got, ready := provider.PeerParameters(); !ready || got != inner.parameters {
+			t.Fatal("negotiated MTU or capabilities changed")
+		}
+		inner.ready = false
+		if _, ready := provider.PeerParameters(); ready {
+			t.Fatal("pending negotiation reported ready")
+		}
+		inner.ready = true
+	}
+	plain := NewPortDemux(&captureTransport{}, 12000, 12999)
+	if _, ready := plain.PeerParameters(); ready {
+		t.Fatal("legacy carrier reported negotiated parameters")
+	}
+}
+
 func packetTo(proto byte, port uint16) []byte {
 	p := make([]byte, 40)
 	p[0] = 0x45

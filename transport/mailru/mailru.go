@@ -194,8 +194,10 @@ func NewMailruDocsTransport(weblink string, config transport.TransportConfig) *M
 func (t *MailruDocsTransport) BatchPacketLimit() int { return 1 }
 
 func (t *MailruDocsTransport) CarrierLimits() transport.CarrierLimits {
-	// Conservative binary limit, allowing for Base64 and the cursor JSON envelope.
-	return transport.CarrierLimits{MaxPayloadBytes: 2048, MaxBatchPackets: 1}
+	// Apply the budget to encoded cursor messages, not just binary ciphertext:
+	// Base64 adds a third, followed by the length prefix and JSON envelope.
+	// Oversized ciphertext is fragmented before reaching this carrier.
+	return transport.CarrierLimits{MaxPayloadBytes: 1450, MaxBatchPackets: 1}
 }
 
 func (t *MailruDocsTransport) DiagnosticStatus() transport.CarrierDiagnostic {
@@ -467,8 +469,14 @@ func (t *MailruDocsTransport) writerLoop() {
 		t.Mu.RLock()
 		session := t.session
 		t.Mu.RUnlock()
-		if session == nil || session.Conn == nil {
-			time.Sleep(15 * time.Millisecond)
+		if session == nil || session.Conn == nil || !t.IsConnected() {
+			// Reconnects retain the old queue. A WebSocket/Socket.IO socket is
+			// not admitted to editor traffic until the current auth succeeds.
+			select {
+			case <-t.Done():
+				return
+			case <-time.After(15 * time.Millisecond):
+			}
 			continue
 		}
 

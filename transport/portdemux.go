@@ -40,6 +40,13 @@ func (d *PortDemux) Receive(cb func([]byte)) {
 // transport and receives only the reserved-port traffic.
 func (d *PortDemux) Side() Transport { return sideEnd{d} }
 
+func (d *PortDemux) PeerParameters() (PeerParameters, bool) {
+	if provider, ok := d.Transport.(PeerParameterProvider); ok {
+		return provider.PeerParameters()
+	}
+	return PeerParameters{}, false
+}
+
 func (d *PortDemux) dispatch(p []byte) {
 	d.mu.RLock()
 	cb := d.main
@@ -70,11 +77,12 @@ func tcpDestinationPort(p []byte) (uint16, bool) {
 
 type sideEnd struct{ d *PortDemux }
 
-func (s sideEnd) Start() error          { return nil }
-func (s sideEnd) Stop() error           { return nil }
-func (s sideEnd) Send(p []byte) error   { return s.d.Transport.Send(p) }
-func (s sideEnd) IsConnected() bool     { return s.d.Transport.IsConnected() }
-func (s sideEnd) Stats() TransportStats { return TransportStats{} }
+func (s sideEnd) Start() error                           { return nil }
+func (s sideEnd) Stop() error                            { return nil }
+func (s sideEnd) Send(p []byte) error                    { return s.d.Transport.Send(p) }
+func (s sideEnd) IsConnected() bool                      { return s.d.Transport.IsConnected() }
+func (s sideEnd) Stats() TransportStats                  { return TransportStats{} }
+func (s sideEnd) PeerParameters() (PeerParameters, bool) { return s.d.PeerParameters() }
 func (s sideEnd) Receive(cb func([]byte)) {
 	s.d.mu.Lock()
 	s.d.side = cb

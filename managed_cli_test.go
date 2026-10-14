@@ -229,7 +229,7 @@ func TestManagedCLIEndToEnd(t *testing.T) {
 	if err := os.WriteFile(conf, []byte(text), 0600); err != nil {
 		t.Fatal(err)
 	}
-	exitCmd := exec.Command(binary, "--role=exit", "--mode=l4", "--negotiate", "--forward-secrecy", "--transport=direct", "--direct-listen="+address, "--encryption-key-file="+key, "--debug=2")
+	exitCmd := exec.Command(binary, "--role=exit", "--mode=l4", "--negotiate", "--forward-secrecy", "--max-packet-size=1280", "--transport=direct", "--direct-listen="+address, "--encryption-key-file="+key, "--debug=2")
 	var exitLog boundedLog
 	exitCmd.Stdout, exitCmd.Stderr = &exitLog, &exitLog
 	exit, err := startOwned(exitCmd)
@@ -238,7 +238,8 @@ func TestManagedCLIEndToEnd(t *testing.T) {
 	}
 	defer exit.stop()
 	// Doctor must authenticate both cryptographic layers and read a large TLS
-	// response through a real direct carrier and HTTP CONNECT proxy.
+	// response through a real direct carrier and HTTP CONNECT proxy. The
+	// Manager facade must preserve the negotiated 1280-byte MTU for the stack.
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	doctor := exec.CommandContext(ctx, binary, "doctor", "--config="+conf, "--json", "--timeout=20s", "--probe-url="+server.URL, "--probe-ca-file="+ca)
