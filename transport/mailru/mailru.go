@@ -197,7 +197,7 @@ func (t *MailruDocsTransport) CarrierLimits() transport.CarrierLimits {
 	// Apply the budget to encoded cursor messages, not just binary ciphertext:
 	// Base64 adds a third, followed by the length prefix and JSON envelope.
 	// Oversized ciphertext is fragmented before reaching this carrier.
-	return transport.CarrierLimits{MaxPayloadBytes: 1450, MaxBatchPackets: 1}
+	return transport.CarrierLimits{MaxPayloadBytes: 1450, MaxBatchPackets: 1, MaxIPv4PacketBytes: 1280}
 }
 
 func (t *MailruDocsTransport) DiagnosticStatus() transport.CarrierDiagnostic {

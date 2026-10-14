@@ -307,6 +307,13 @@ func (s *Session) AddTransport(name string, raw Transport, secret, context strin
 	if name == "" {
 		return errors.New("session: empty transport name")
 	}
+	packetLimit := 0
+	if carrier, ok := raw.(LimitedCarrier); ok {
+		packetLimit = carrier.CarrierLimits().MaxIPv4PacketBytes
+		if packetLimit != 0 && (packetLimit < 1280 || packetLimit > MaxNegotiatedPacket) {
+			return errors.New("session: carrier IPv4 packet limit must be 1280..65000")
+		}
+	}
 
 	s.mu.Lock()
 	if s.started {
@@ -325,6 +332,9 @@ func (s *Session) AddTransport(name string, raw Transport, secret, context strin
 	}
 
 	s.mu.Lock()
+	if packetLimit > 0 {
+		s.params.MaxPacketSize = minInt(s.params.MaxPacketSize, packetLimit)
+	}
 	s.links[name] = link
 	s.order = insertByPriority(s.order, name, link.priority, s.links)
 	s.mu.Unlock()

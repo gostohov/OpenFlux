@@ -79,6 +79,52 @@ func TestSessionBuffersShortCarrierOutageWithoutNewHandshake(t *testing.T) {
 
 type limitedNegotiationWire struct{ *negotiationWire }
 
+type packetLimitedNegotiationWire struct{ *negotiationWire }
+
+func (*packetLimitedNegotiationWire) CarrierLimits() CarrierLimits {
+	return CarrierLimits{MaxIPv4PacketBytes: 1280}
+}
+
+func TestBootstrapCarrierCapsNegotiatedPacketSize(t *testing.T) {
+	a, b := &negotiationWire{}, &negotiationWire{}
+	a.peer, b.peer = b, a
+	params := PeerParameters{Capabilities: CapabilityIPv4 | CapabilityTCP, MaxPacketSize: MaxNegotiatedPacket}
+	client, _ := NewSession(params, false)
+	exit, _ := NewSession(params, true)
+	t.Cleanup(func() { _ = client.Stop(); _ = exit.Stop() })
+	if err := client.AddTransport("limited", &packetLimitedNegotiationWire{a}, testSessionSecret, testSessionCtx, 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := exit.AddTransport("primary", b, testSessionSecret, testSessionCtx, 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := exit.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Start(); err != nil {
+		t.Fatal(err)
+	}
+	for _, session := range []*Session{client, exit} {
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			negotiated, ready := session.PeerParameters()
+			if ready {
+				if negotiated.MaxPacketSize != 1280 {
+					t.Fatalf("carrier packet cap was not negotiated: %+v", negotiated)
+				}
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("carrier-cap negotiation did not complete")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if err := client.Send(testIPv4(1281, 6)); err == nil {
+		t.Fatal("oversized packet passed the negotiated carrier cap")
+	}
+}
+
 func (*limitedNegotiationWire) BatchPacketLimit() int { return 1 }
 
 func TestSessionCarrierLimitKeepsEncryptedBurstWithinMTU(t *testing.T) {

@@ -18,6 +18,9 @@ type CarrierLimits struct {
 	MaxPayloadBytes   int
 	MaxBatchPackets   int
 	MessagesPerSecond int
+	// Applied to the Session advertisement while registering bootstrap
+	// carriers. It keeps routine IP traffic within a carrier's safe budget.
+	MaxIPv4PacketBytes int
 }
 
 type LimitedCarrier interface{ CarrierLimits() CarrierLimits }
